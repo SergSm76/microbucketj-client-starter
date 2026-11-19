@@ -7,6 +7,7 @@ import my.app.microbucketj.client.model.AcquireStatus;
 import my.app.microbucketj.client.model.BucketGetResult;
 import my.app.microbucketj.client.model.BucketUpsertRequest;
 import my.app.microbucketj.client.model.BucketUpsertResult;
+import my.app.microbucketj.client.model.LockResult;
 import my.app.microbucketj.client.model.ReportResult;
 
 import java.util.Objects;
@@ -84,6 +85,67 @@ public final class NettyMicroBucketJFailoverTransport implements AutoCloseable {
         () -> getOn(passive, bucket),
         r -> r == null || r.isUnavailable(),
         () -> BucketGetResult.unavailable(bucket)
+    );
+  }
+
+  // --- Shedlock (Distributed Locks) Failover Methods ---
+  public CompletableFuture<LockResult> lockAcquire(String name, long lockUntilMs, String lockedBy) {
+    return withFailover(
+        () -> lockAcquireOn(active, name, lockUntilMs, lockedBy),
+        () -> {
+          log.warn("microbucketj client lockAcquire: активная группа эндпоинтов недоступна для lock={}", name);
+          return lockAcquireOn(passive, name, lockUntilMs, lockedBy);
+        },
+        r -> r == null || r.isUnavailable(),
+        LockResult::unavailable
+    );
+  }
+
+  public CompletableFuture<LockResult> lockRelease(String name, String lockedBy) {
+    return withFailover(
+        () -> lockReleaseOn(active, name, lockedBy),
+        () -> {
+          log.warn("microbucketj client lockRelease: активная группа эндпоинтов недоступна для lock={}", name);
+          return lockReleaseOn(passive, name, lockedBy);
+        },
+        r -> r == null || r.isUnavailable(),
+        LockResult::unavailable
+    );
+  }
+
+  public CompletableFuture<LockResult> lockUpdate(String name, long lockUntilMs, String lockedBy) {
+    return withFailover(
+        () -> lockUpdateOn(active, name, lockUntilMs, lockedBy),
+        () -> {
+          log.warn("microbucketj client lockUpdate: активная группа эндпоинтов недоступна для lock={}", name);
+          return lockUpdateOn(passive, name, lockUntilMs, lockedBy);
+        },
+        r -> r == null || r.isUnavailable(),
+        LockResult::unavailable
+    );
+  }
+
+  public CompletableFuture<LockResult> lockGet(String name) {
+    return withFailover(
+        () -> lockGetOn(active, name),
+        () -> {
+          log.warn("microbucketj client lockGet: активная группа эндпоинтов недоступна для lock={}", name);
+          return lockGetOn(passive, name);
+        },
+        r -> r == null || r.isUnavailable(),
+        LockResult::unavailable
+    );
+  }
+
+  public CompletableFuture<LockResult> lockDelete(String name) {
+    return withFailover(
+        () -> lockDeleteOn(active, name),
+        () -> {
+          log.warn("microbucketj client lockDelete: активная группа эндпоинтов недоступна для lock={}", name);
+          return lockDeleteOn(passive, name);
+        },
+        r -> r == null || r.isUnavailable(),
+        LockResult::unavailable
     );
   }
 
@@ -169,6 +231,46 @@ public final class NettyMicroBucketJFailoverTransport implements AutoCloseable {
     }
     return transport.upsertFollowingRedirects(req)
         .exceptionally(ex -> BucketUpsertResult.unavailable(bucket));
+  }
+
+  private CompletableFuture<LockResult> lockAcquireOn(NettyMicroBucketJTransport transport, String name, long lockUntilMs, String lockedBy) {
+    if (transport == null) {
+      return CompletableFuture.completedFuture(LockResult.unavailable());
+    }
+    return transport.lockAcquire(name, lockUntilMs, lockedBy)
+        .exceptionally(ex -> LockResult.unavailable());
+  }
+
+  private CompletableFuture<LockResult> lockReleaseOn(NettyMicroBucketJTransport transport, String name, String lockedBy) {
+    if (transport == null) {
+      return CompletableFuture.completedFuture(LockResult.unavailable());
+    }
+    return transport.lockRelease(name, lockedBy)
+        .exceptionally(ex -> LockResult.unavailable());
+  }
+
+  private CompletableFuture<LockResult> lockUpdateOn(NettyMicroBucketJTransport transport, String name, long lockUntilMs, String lockedBy) {
+    if (transport == null) {
+      return CompletableFuture.completedFuture(LockResult.unavailable());
+    }
+    return transport.lockUpdate(name, lockUntilMs, lockedBy)
+        .exceptionally(ex -> LockResult.unavailable());
+  }
+
+  private CompletableFuture<LockResult> lockGetOn(NettyMicroBucketJTransport transport, String name) {
+    if (transport == null) {
+      return CompletableFuture.completedFuture(LockResult.unavailable());
+    }
+    return transport.lockGet(name)
+        .exceptionally(ex -> LockResult.unavailable());
+  }
+
+  private CompletableFuture<LockResult> lockDeleteOn(NettyMicroBucketJTransport transport, String name) {
+    if (transport == null) {
+      return CompletableFuture.completedFuture(LockResult.unavailable());
+    }
+    return transport.lockDelete(name)
+        .exceptionally(ex -> LockResult.unavailable());
   }
 
   private BucketUpsertResult selectUpsertResult(String bucket, BucketUpsertResult activeResult, BucketUpsertResult passiveResult) {

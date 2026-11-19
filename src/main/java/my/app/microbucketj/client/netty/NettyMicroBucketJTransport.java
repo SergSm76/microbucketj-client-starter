@@ -28,12 +28,13 @@ import my.app.microbucketj.client.model.BucketType;
 import my.app.microbucketj.client.model.BucketUpsertRequest;
 import my.app.microbucketj.client.model.BucketUpsertResult;
 import my.app.microbucketj.client.model.LeaderHint;
+import my.app.microbucketj.client.model.LockEntry;
+import my.app.microbucketj.client.model.LockResult;
 import my.app.microbucketj.client.model.ReportResult;
 import my.app.microbucketj.client.protocol.ApiProtocol;
 import my.app.microbucketj.client.protocol.ProtocolVersion;
 
 import java.net.InetSocketAddress;
-import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.List;
 import java.util.Objects;
@@ -44,6 +45,8 @@ import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
+
+import static java.nio.charset.StandardCharsets.UTF_8;
 
 @Slf4j
 @SuppressWarnings({"checkstyle:AbbreviationAsWordInName"})
@@ -293,7 +296,7 @@ public final class NettyMicroBucketJTransport implements AutoCloseable {
     });
   }
 
-  private CompletableFuture<Object> send(RespKind kind, String bucket, BucketUpsertRequest upsertReq, PayloadEncoder encoder) {
+  private CompletableFuture<Object> send(RespKind kind, String resName, BucketUpsertRequest upsertReq, PayloadEncoder encoder) {
     Connection c = pickConnection();
     if (c == null) {
       return CompletableFuture.failedFuture(new IllegalStateException("no connections"));
@@ -301,7 +304,7 @@ public final class NettyMicroBucketJTransport implements AutoCloseable {
 
     int reqId = c.nextRequestId();
     CompletableFuture<Object> out = new CompletableFuture<>();
-    c.pending.put(reqId, new Pending(kind, bucket, upsertReq, out));
+    c.pending.put(reqId, new Pending(kind, resName, upsertReq, out));
 
     CompletableFuture<Channel> chFut = ensureConnectedAsync(c);
     return chFut.handle((ch, connErr) -> {
@@ -431,7 +434,7 @@ public final class NettyMicroBucketJTransport implements AutoCloseable {
   }
 
   private CompletableFuture<Object> sendSingle(InetSocketAddress endpoint,
-                                               String bucket,
+                                               String resName,
                                                BucketUpsertRequest upsertReq,
                                                PayloadEncoder encoder) {
     if (closed) {
@@ -486,7 +489,10 @@ public final class NettyMicroBucketJTransport implements AutoCloseable {
               case ACQUIRE -> decodeAcquirePayload(st, in);
               case REPORT -> decodeReportPayload(st);
               case UPSERT -> decodeUpsertPayload(st, upsertReq, in);
-              case GET -> decodeGetPayload(st, bucket, in);
+              case GET -> decodeGetPayload(st, resName, in);
+              case LOCK_ACQUIRE, LOCK_RELEASE, LOCK_UPDATE -> decodeLockPayload(st, resName, in);
+              case LOCK_GET -> decodeLockGetPayload(st, resName, in);
+              case LOCK_DELETE -> decodeLockSimplePayload(st);
             };
             if (timeout != null) {
               timeout.cancel(false);
@@ -554,18 +560,23 @@ public final class NettyMicroBucketJTransport implements AutoCloseable {
     ACQUIRE,
     REPORT,
     UPSERT,
-    GET
+    GET,
+    LOCK_ACQUIRE,
+    LOCK_RELEASE,
+    LOCK_UPDATE,
+    LOCK_GET,
+    LOCK_DELETE
   }
 
   private static final class Pending {
     final RespKind kind;
-    final String bucket;
+    final String resName;  // Имя ресурса (например имя Бакета или имя Блокировки)
     final BucketUpsertRequest upsertReq;
     final CompletableFuture<Object> future;
 
-    Pending(RespKind kind, String bucket, BucketUpsertRequest upsertReq, CompletableFuture<Object> future) {
+    Pending(RespKind kind, String resName, BucketUpsertRequest upsertReq, CompletableFuture<Object> future) {
       this.kind = kind;
-      this.bucket = bucket;
+      this.resName = resName;
       this.upsertReq = upsertReq;
       this.future = future;
     }
@@ -625,7 +636,10 @@ public final class NettyMicroBucketJTransport implements AutoCloseable {
           case ACQUIRE -> decodeAcquirePayload(st, in);
           case REPORT -> decodeReportPayload(st);
           case UPSERT -> decodeUpsertPayload(st, p.upsertReq, in);
-          case GET -> decodeGetPayload(st, p.bucket, in);
+          case GET -> decodeGetPayload(st, p.resName, in);
+          case LOCK_ACQUIRE, LOCK_RELEASE, LOCK_UPDATE -> decodeLockPayload(st, p.resName, in);
+          case LOCK_GET -> decodeLockGetPayload(st, p.resName, in);
+          case LOCK_DELETE -> decodeLockSimplePayload(st);
         };
         p.future.complete(decoded);
       } catch (Throwable t) {
@@ -702,6 +716,32 @@ public final class NettyMicroBucketJTransport implements AutoCloseable {
         spec.adaptiveMinRequests, spec.adaptiveFailureRatePct,
         spec.adaptiveMinFactorPct, spec.adaptiveDecreaseStepPct,
         spec.adaptiveIncreaseStepPct, spec.stepCapacities);
+  }
+
+  private static Object decodeLockPayload(byte st, String name, ByteBuf in) {
+    if (in.readableBytes() < 16) return LockResult.unavailable(); // lockUntil + lockedAt
+    long lockUntilMs = in.readLong();
+    long lockedAtMs = in.readLong();
+    return new LockResult(st, new LockEntry(name != null ? name : "", lockUntilMs, lockedAtMs, ""));
+  }
+
+  private static Object decodeLockGetPayload(byte st, String name, ByteBuf in) {
+    if (st == ApiProtocol.ST_NOT_FOUND) return new LockResult(st, null);
+    if (in.readableBytes() < 16 + 1) return LockResult.unavailable(); // + ownerLen
+    long lockUntilMs = in.readLong();
+    long lockedAtMs = in.readLong();
+    int ownerLen = in.readUnsignedByte();
+    String lockedBy = "";
+    if (ownerLen > 0 && in.readableBytes() >= ownerLen) {
+      byte[] ownerBytes = new byte[ownerLen];
+      in.readBytes(ownerBytes);
+      lockedBy = new String(ownerBytes, UTF_8);
+    }
+    return new LockResult(st, new LockEntry(name != null ? name : "", lockUntilMs, lockedAtMs, lockedBy));
+  }
+
+  private static Object decodeLockSimplePayload(byte st) {
+    return new LockResult(st, null);
   }
 
   private static final class AdminSpecView {
@@ -856,7 +896,7 @@ public final class NettyMicroBucketJTransport implements AutoCloseable {
       return new byte[0];
     }
     return bucketNameBytesCache.computeIfAbsent(bucket, key -> {
-      byte[] bytes = key.getBytes(StandardCharsets.UTF_8);
+      byte[] bytes = key.getBytes(UTF_8);
       if (bytes.length <= 0 || bytes.length > ApiProtocol.MAX_BUCKET_BYTES) {
         return new byte[0];
       }
@@ -889,7 +929,7 @@ public final class NettyMicroBucketJTransport implements AutoCloseable {
     }
     byte[] bytes = new byte[len];
     in.readBytes(bytes);
-    return new String(bytes, StandardCharsets.UTF_8);
+    return new String(bytes, UTF_8);
   }
 
   private static long readLongOrZero(ByteBuf in) {
@@ -903,5 +943,105 @@ public final class NettyMicroBucketJTransport implements AutoCloseable {
   @FunctionalInterface
   private interface PayloadEncoder {
     ByteBuf encode(Channel ch, int requestId);
+  }
+
+  private byte[] requireLockNameBytes(String name) {
+    if (name == null || name.isBlank()) return null;
+    byte[] bytes = name.getBytes(UTF_8);
+    if (bytes.length > ApiProtocol.MAX_LOCK_NAME_BYTES) return null;
+    return bytes;
+  }
+
+  private byte[] requireLockOwnerBytes(String owner) {
+    if (owner == null || owner.isBlank()) return null;
+    byte[] bytes = owner.getBytes(UTF_8);
+    if (bytes.length > ApiProtocol.MAX_LOCK_OWNER_BYTES) return null;
+    return bytes;
+  }
+
+  public CompletableFuture<LockResult> lockAcquire(String name, long lockUntilMs, String lockedBy) {
+    if (closed) return CompletableFuture.completedFuture(LockResult.unavailable());
+    byte[] nameBytes = requireLockNameBytes(name);
+    byte[] ownerBytes = requireLockOwnerBytes(lockedBy);
+    if (nameBytes == null || ownerBytes == null) return CompletableFuture.completedFuture(LockResult.badRequest());
+
+    return send(RespKind.LOCK_ACQUIRE, name, null, (ch, reqId) -> {
+      ByteBuf out = ch.alloc().ioBuffer(1 + 4 + 1 + nameBytes.length + 8 + 1 + ownerBytes.length);
+      out.writeByte(ApiProtocol.OP_LOCK_ACQUIRE);
+      out.writeInt(reqId);
+      out.writeByte(nameBytes.length);
+      out.writeBytes(nameBytes);
+      out.writeLong(lockUntilMs);
+      out.writeByte(ownerBytes.length);
+      out.writeBytes(ownerBytes);
+      return out;
+    }).handle((resp, err) -> (err != null || resp == null) ? LockResult.unavailable() : (LockResult) resp);
+  }
+
+  public CompletableFuture<LockResult> lockRelease(String name, String lockedBy) {
+    if (closed) return CompletableFuture.completedFuture(LockResult.unavailable());
+    byte[] nameBytes = requireLockNameBytes(name);
+    byte[] ownerBytes = requireLockOwnerBytes(lockedBy);
+    if (nameBytes == null || ownerBytes == null) return CompletableFuture.completedFuture(LockResult.badRequest());
+
+    return send(RespKind.LOCK_RELEASE, name, null, (ch, reqId) -> {
+      ByteBuf out = ch.alloc().ioBuffer(1 + 4 + 1 + nameBytes.length + 1 + ownerBytes.length);
+      out.writeByte(ApiProtocol.OP_LOCK_RELEASE);
+      out.writeInt(reqId);
+      out.writeByte(nameBytes.length);
+      out.writeBytes(nameBytes);
+      out.writeByte(ownerBytes.length);
+      out.writeBytes(ownerBytes);
+      return out;
+    }).handle((resp, err) -> (err != null || resp == null) ? LockResult.unavailable() : (LockResult) resp);
+  }
+
+  public CompletableFuture<LockResult> lockUpdate(String name, long lockUntilMs, String lockedBy) {
+    if (closed) return CompletableFuture.completedFuture(LockResult.unavailable());
+    byte[] nameBytes = requireLockNameBytes(name);
+    byte[] ownerBytes = requireLockOwnerBytes(lockedBy);
+    if (nameBytes == null || ownerBytes == null) return CompletableFuture.completedFuture(LockResult.badRequest());
+
+    return send(RespKind.LOCK_UPDATE, name, null, (ch, reqId) -> {
+      ByteBuf out = ch.alloc().ioBuffer(1 + 4 + 1 + nameBytes.length + 8 + 1 + ownerBytes.length);
+      out.writeByte(ApiProtocol.OP_LOCK_UPDATE);
+      out.writeInt(reqId);
+      out.writeByte(nameBytes.length);
+      out.writeBytes(nameBytes);
+      out.writeLong(lockUntilMs);
+      out.writeByte(ownerBytes.length);
+      out.writeBytes(ownerBytes);
+      return out;
+    }).handle((resp, err) -> (err != null || resp == null) ? LockResult.unavailable() : (LockResult) resp);
+  }
+
+  public CompletableFuture<LockResult> lockGet(String name) {
+    if (closed) return CompletableFuture.completedFuture(LockResult.unavailable());
+    byte[] nameBytes = requireLockNameBytes(name);
+    if (nameBytes == null) return CompletableFuture.completedFuture(LockResult.badRequest());
+
+    return send(RespKind.LOCK_GET, name, null, (ch, reqId) -> {
+      ByteBuf out = ch.alloc().ioBuffer(1 + 4 + 1 + nameBytes.length);
+      out.writeByte(ApiProtocol.OP_LOCK_GET);
+      out.writeInt(reqId);
+      out.writeByte(nameBytes.length);
+      out.writeBytes(nameBytes);
+      return out;
+    }).handle((resp, err) -> (err != null || resp == null) ? LockResult.unavailable() : (LockResult) resp);
+  }
+
+  public CompletableFuture<LockResult> lockDelete(String name) {
+    if (closed) return CompletableFuture.completedFuture(LockResult.unavailable());
+    byte[] nameBytes = requireLockNameBytes(name);
+    if (nameBytes == null) return CompletableFuture.completedFuture(LockResult.badRequest());
+
+    return send(RespKind.LOCK_DELETE, name, null, (ch, reqId) -> {
+      ByteBuf out = ch.alloc().ioBuffer(1 + 4 + 1 + nameBytes.length);
+      out.writeByte(ApiProtocol.OP_LOCK_DELETE);
+      out.writeInt(reqId);
+      out.writeByte(nameBytes.length);
+      out.writeBytes(nameBytes);
+      return out;
+    }).handle((resp, err) -> (err != null || resp == null) ? LockResult.unavailable() : (LockResult) resp);
   }
 }

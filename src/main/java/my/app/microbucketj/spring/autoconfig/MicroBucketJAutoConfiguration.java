@@ -1,5 +1,7 @@
 package my.app.microbucketj.spring.autoconfig;
 
+import my.app.microbucketj.client.MicroBucketJLockClient;
+import my.app.microbucketj.client.netty.NettyMicroBucketJLockClient;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Bean;
@@ -62,6 +64,11 @@ public class MicroBucketJAutoConfiguration {
   @Bean
   public MicroBucketJBucketAdminClient microBucketAdminClientImpl(NettyMicroBucketJFailoverTransport transport) {
     return new NettyMicroBucketJBucketJBucketAdminClient(transport);
+  }
+
+  @Bean
+  public MicroBucketJLockClient microBucketJLockClient(NettyMicroBucketJFailoverTransport transport) {
+    return new NettyMicroBucketJLockClient(transport);
   }
 
   @Bean
